@@ -17,6 +17,30 @@ YouTube Data API v3 ───┤ extract_youtube ─► raw (JSON) ─► prepro
                        └──────────────── any task failing after its retries ─► e-mail alert ───────────────┘
 ```
 
+## Tech stack
+
+| Layer | Technology | Version | Role in the pipeline |
+|---|---|---|---|
+| Orchestration | Apache Airflow (LocalExecutor, Python 3.12) | 3.3.2 | Schedules and runs the single DAG `music_catalog_elt`: retries, incremental runs, e-mail on failure |
+| dbt ↔ Airflow | Astronomer Cosmos | 1.15.1 | Renders every dbt model and test as its own Airflow task |
+| Transformation | dbt-core + dbt-clickhouse | 1.11.15 / 1.10.3 | staging → intermediate → marts, data tests and a unit test; installed in an isolated venv (`/opt/dbt_venv`) |
+| Preprocessing | pandas (+ NumPy), openpyxl | ≥ 2.2 / ≥ 3.1 | Flattens API JSON, standardises, validates, de-duplicates, computes the SCD2 diff; reads the `.xlsx` catalog |
+| HTTP client | requests | ≥ 2.32 | Calls the Spotify, YouTube and Superset REST APIs (retry/backoff is a plain loop) |
+| Data warehouse | ClickHouse (LTS) + clickhouse-connect | 26.8 / 1.10.0 | Stores the `raw`, `clean`, `staging`, `intermediate`, `marts`, `dq` and `ops` databases (MergeTree) |
+| BI / dashboards | Apache Superset | 6.0.0 | Dashboards on the marts; databases, datasets, charts and dashboards are created by the DAG through the Superset API |
+| Metadata DB | PostgreSQL | 16 | Metadata store for Airflow and Superset |
+| Alerting | SMTP (Python `smtplib`, Gmail + STARTTLS) | — | E-mail alerts for failed tasks and quarantined records |
+| Testing | pytest, dbt tests | ≥ 8 | Unit tests of the DAG file; dbt schema, singular and unit tests |
+| Infrastructure | Docker + Docker Compose | — | Runs every service; all credentials come from `.env` |
+
+**Data sources**
+
+| Source | Access | Used for |
+|---|---|---|
+| Google Sheets ("[DE TS] Songs Data") | Public CSV export (`gviz/tq?tqx=out:csv`); `.xlsx` copy in `data/catalog/` as fallback | Internal song catalog (title, original artist) |
+| Spotify Web API | OAuth 2.0 Client Credentials | Track search and track details → ISRCs per song |
+| YouTube Data API v3 | API key | Video search and video details → videos per song |
+
 ## Quick start
 
 ```bash
