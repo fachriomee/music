@@ -1,0 +1,39 @@
+<!--
+  Local-dev server overrides, merged on top of the image's config.xml.
+  Goal: keep ClickHouse lean on a laptop (it shares RAM with Airflow + Superset)
+  while keeping the observability tables we actually use (query_log, part_log).
+-->
+<clickhouse>
+    <logger>
+        <!-- 'information' is chatty; warnings are enough for local work -->
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+
+    <!-- Store and return timestamps in UTC; convert at the BI layer -->
+    <timezone>UTC</timezone>
+
+    <!-- Use at most 80% of the container memory limit (mem_limit in compose) -->
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Smaller caches than the server defaults (5 GiB) — the dataset is tiny -->
+    <mark_cache_size>268435456</mark_cache_size>            <!-- 256 MiB -->
+    <uncompressed_cache_size>268435456</uncompressed_cache_size>
+
+    <!-- Keep query_log (used for monitoring) but expire it after 14 days -->
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <partition_by>toYYYYMM(event_date)</partition_by>
+        <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_log>
+
+    <!-- High-frequency profiling logs we do not need locally: disable them -->
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <text_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <latency_log remove="1"/>
+</clickhouse>

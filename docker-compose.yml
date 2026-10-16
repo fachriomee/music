@@ -1,0 +1,287 @@
+# =============================================================================
+# Massive Music — song-metadata pipeline (local, fully containerised)
+# -----------------------------------------------------------------------------
+#   postgres     metadata DB for Airflow + Superset
+#   clickhouse   warehouse: raw -> clean (upsert, SCD2) -> staging -> intermediate -> marts
+#   airflow-*    Airflow 3 (LocalExecutor): ONE DAG file + dbt project in ./airflow/dags
+#   superset     BI: Song Catalog, Pipeline Health, Data Quarantine dashboards
+#
+# Every credential comes from .env (`${VAR:?...}` = compose refuses to start
+# without it); nothing secret is written in this file.
+#
+#   docker compose up -d --build
+#   Airflow http://localhost:8080 · Superset http://localhost:8088 · ClickHouse http://localhost:8123/play
+# =============================================================================
+name: massive-music-elt
+
+x-pipeline-env: &pipeline-env
+  # --- ClickHouse (address inside the docker network)
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: 8123
+  CLICKHOUSE_ETL_USER: ${CLICKHOUSE_ETL_USER:?set CLICKHOUSE_ETL_USER in .env}
+  CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?set CLICKHOUSE_ETL_PASSWORD in .env}
+  CLICKHOUSE_BI_USER: ${CLICKHOUSE_BI_USER:?set CLICKHOUSE_BI_USER in .env}
+  CLICKHOUSE_BI_PASSWORD: ${CLICKHOUSE_BI_PASSWORD:?set CLICKHOUSE_BI_PASSWORD in .env}
+  # --- Catalog sheet
+  CATALOG_SOURCE: ${CATALOG_SOURCE:-file}
+  CATALOG_FILE_PATH: ${CATALOG_FILE_PATH:-/opt/airflow/data/catalog/DE_TS_Song_Catalog_Data.xlsx}
+  CATALOG_SHEET_NAME: ${CATALOG_SHEET_NAME:-Data}
+  GSHEET_ID: ${GSHEET_ID:-}
+  # --- Spotify Web API
+  SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:?set SPOTIFY_CLIENT_ID in .env}
+  SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:?set SPOTIFY_CLIENT_SECRET in .env}
+  SPOTIFY_MARKET: ${SPOTIFY_MARKET:-ID}
+  SPOTIFY_SEARCH_LIMIT: ${SPOTIFY_SEARCH_LIMIT:-10}
+  SPOTIFY_ARTIST_QUERY_PAGES: ${SPOTIFY_ARTIST_QUERY_PAGES:-1}
+  SPOTIFY_MAX_PAGES: ${SPOTIFY_MAX_PAGES:-3}
+  SPOTIFY_MIN_INTERVAL_SECONDS: ${SPOTIFY_MIN_INTERVAL_SECONDS:-0.25}
+  SPOTIFY_REFRESH_DAYS: ${SPOTIFY_REFRESH_DAYS:-7}
+  # --- YouTube Data API v3
+  YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:?set YOUTUBE_API_KEY in .env}
+  YOUTUBE_REGION_CODE: ${YOUTUBE_REGION_CODE:-ID}
+  YOUTUBE_MAX_RESULTS: ${YOUTUBE_MAX_RESULTS:-50}
+  YOUTUBE_VIDEO_CATEGORY_ID: ${YOUTUBE_VIDEO_CATEGORY_ID:-}
+  YOUTUBE_DAILY_QUOTA_UNITS: ${YOUTUBE_DAILY_QUOTA_UNITS:-10000}
+  YOUTUBE_QUOTA_SAFETY_RATIO: ${YOUTUBE_QUOTA_SAFETY_RATIO:-0.9}
+  YOUTUBE_REFRESH_DAYS: ${YOUTUBE_REFRESH_DAYS:-30}
+  # --- Pipeline behaviour
+  MAX_SONGS_PER_RUN: ${MAX_SONGS_PER_RUN:-0}
+  SCD_MAX_DELETE_RATIO: ${SCD_MAX_DELETE_RATIO:-0.2}
+  # --- Superset (publish_dashboards task, REST API)
+  SUPERSET_URL: http://superset:8088
+  SUPERSET_UI_URL: ${SUPERSET_UI_URL:-http://localhost:8088}
+  SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:?set SUPERSET_ADMIN_USER in .env}
+  SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?set SUPERSET_ADMIN_PASSWORD in .env}
+  # --- E-mail alerts (task failure + quarantined data)
+  ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:?set ALERT_EMAIL_TO in .env}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_MAIL_FROM: ${SMTP_MAIL_FROM:-}
+  AIRFLOW_UI_URL: ${AIRFLOW_UI_URL:-http://localhost:8080}
+  # --- dbt. Cosmos copies the project to a temp dir for every task, with its own
+  # target/: do NOT set DBT_TARGET_PATH here, or parallel dbt tasks would share
+  # one target/ and read each other's results.
+  DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+
+# -----------------------------------------------------------------------------
+# Airflow common block (pattern of the official Airflow 3 compose file, trimmed
+# to LocalExecutor: no Redis / Celery workers needed at this scale)
+# -----------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  # Built ONCE by airflow-init; the other services reuse the local image
+  # (parallel builds of one tag fail on Docker Desktop's containerd store).
+  image: massive-music/airflow:3.3.2
+  pull_policy: never
+  environment: &airflow-common-env
+    <<: *pipeline-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+    # Unpaused at creation: the first run starts automatically after `up`
+    # (catchup=False => only the latest interval, never a backfill).
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__PARALLELISM: 8
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
+    # Airflow 3: workers talk to the API server's Execution API (not to the DB)
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: 30
+    AIRFLOW__COSMOS__ENABLE_CACHE: "true"            # cache `dbt ls` between DAG parses
+    AIRFLOW__COSMOS__PROPAGATE_LOGS: "false"         # avoid every dbt log line twice
+    # No Airflow Assets per dbt model (this DAG is time-scheduled): on Airflow 3,
+    # parallel dbt tasks registering the same new Asset collide in the metadata DB.
+    AIRFLOW__COSMOS__ENABLE_DATASET_ALIAS: "false"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags               # the DAG file + dbt/music_dw + tests
+    - airflow-task-logs:/opt/airflow/logs
+    - ./data:/opt/airflow/data:ro                    # catalog export
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    clickhouse:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — metadata store (NOT the warehouse)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # consumed by docker/postgres/initdb/01-superset-db.sh
+      SUPERSET_DB_USER: ${SUPERSET_DB_USER:?set SUPERSET_DB_USER in .env}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:?set SUPERSET_DB_PASSWORD in .env}
+      SUPERSET_DB_NAME: ${SUPERSET_DB_NAME:?set SUPERSET_DB_NAME in .env}
+    volumes:
+      - postgres-metadata:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — analytical warehouse
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8   # 26.8 = LTS line
+    environment:
+      # Admin principal created by the image entrypoint (replaces `default`)
+      CLICKHOUSE_USER: ${CLICKHOUSE_ADMIN_USER:?set CLICKHOUSE_ADMIN_USER in .env}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:?set CLICKHOUSE_ADMIN_PASSWORD in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1      # allow SQL-driven RBAC
+      # consumed by docker/clickhouse/initdb/01_init.sh
+      CLICKHOUSE_ETL_USER: ${CLICKHOUSE_ETL_USER:?set CLICKHOUSE_ETL_USER in .env}
+      CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:?set CLICKHOUSE_ETL_PASSWORD in .env}
+      CLICKHOUSE_BI_USER: ${CLICKHOUSE_BI_USER:?set CLICKHOUSE_BI_USER in .env}
+      CLICKHOUSE_BI_PASSWORD: ${CLICKHOUSE_BI_PASSWORD:?set CLICKHOUSE_BI_PASSWORD in .env}
+    volumes:
+      - clickhouse-warehouse:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/local.xml:/etc/clickhouse-server/config.d/local.xml:ro
+      - ./docker/clickhouse/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"     # HTTP (dbt, Superset, /play UI)
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"   # native TCP (clickhouse-client, DBeaver)
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    mem_limit: 2g                              # ClickHouse sizes its caches from the cgroup limit
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Airflow 3 — orchestration
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: ./docker/airflow
+    pull_policy: build        # the one service that builds massive-music/airflow
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # One-shot bootstrap: DB migration + admin user + folder ownership.
+        mkdir -p /opt/airflow/logs /opt/airflow/dags
+        /entrypoint airflow version
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        echo "airflow-init done"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:?set AIRFLOW_ADMIN_USER in .env}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+    user: "0:0"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler        # with LocalExecutor, tasks (incl. dbt) run here
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8974/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor    # Airflow 3: DAG parsing is its own component
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Superset — BI
+  # ---------------------------------------------------------------------------
+  superset-init:
+    build:
+      context: ./docker/superset
+    image: massive-music/superset:6.0.0
+    command: ["/app/docker/custom/superset-init.sh"]
+    environment: &superset-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?set SUPERSET_SECRET_KEY in .env}
+      SUPERSET_DB_URI: postgresql+psycopg2://${SUPERSET_DB_USER:?set SUPERSET_DB_USER in .env}:${SUPERSET_DB_PASSWORD:?set SUPERSET_DB_PASSWORD in .env}@postgres:5432/${SUPERSET_DB_NAME:?set SUPERSET_DB_NAME in .env}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:?set SUPERSET_ADMIN_USER in .env}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?set SUPERSET_ADMIN_PASSWORD in .env}
+      SUPERSET_ADMIN_EMAIL: ${ALERT_EMAIL_TO:?set ALERT_EMAIL_TO in .env}
+    volumes: &superset-volumes
+      - ./docker/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-data:/app/superset_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  superset:
+    image: massive-music/superset:6.0.0   # built by superset-init
+    pull_policy: never
+    environment: *superset-env
+    volumes: *superset-volumes
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-metadata:
+  clickhouse-warehouse:
+  airflow-task-logs:
+  superset-data:

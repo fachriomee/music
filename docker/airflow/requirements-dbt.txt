@@ -1,0 +1,5 @@
+# Installed into the isolated /opt/dbt_venv (see Dockerfile for the reason).
+# dbt-clickhouse 1.10.x declares dbt-core>=1.9; 1.11.x is the newest core line
+# verified against it for this project (dbt parse/compile/build).
+dbt-core==1.11.15
+dbt-clickhouse==1.10.3

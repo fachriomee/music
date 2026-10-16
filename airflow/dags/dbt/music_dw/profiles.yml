@@ -1,0 +1,19 @@
+# dbt connection profile. Every value comes from environment variables that
+# docker-compose injects from .env into the Airflow containers (no secret here).
+music_dw:
+  target: prod
+  outputs:
+    prod:
+      type: clickhouse
+      driver: http                     # clickhouse-connect over port 8123
+      host: "{{ env_var('CLICKHOUSE_HOST') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT') | int }}"
+      user: "{{ env_var('CLICKHOUSE_ETL_USER') }}"
+      password: "{{ env_var('CLICKHOUSE_ETL_PASSWORD') }}"
+      schema: staging                  # default database for unconfigured models
+      secure: false
+      threads: 4
+      connect_timeout: 10
+      send_receive_timeout: 600
+      custom_settings:
+        join_use_nulls: 1              # LEFT JOIN misses -> NULL (ANSI), not type defaults

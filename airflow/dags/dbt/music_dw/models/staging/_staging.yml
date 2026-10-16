@@ -1,0 +1,99 @@
+version: 2
+
+models:
+  # ---------------------------------------------------------------------------
+  - name: stg_catalog__songs
+    description: >
+      Open SCD2 version of every catalog song (one row per song_code) with the
+      matching keys. Rows rejected by validation are in dq.quarantine_records.
+    data_tests:
+      - min_row_count:
+          arguments: { min_rows: 1 }
+    columns:
+      - name: song_code
+        description: Catalog business key (CODE column), UInt32.
+        data_tests: [unique, not_null]
+      - name: song_title
+        description: Title as in the sheet, standardised by pandas (NFKC, invisible characters removed).
+        data_tests: [not_null]
+      - name: original_artist
+        description: ORIGINAL ARTIST; NULL when blank in the sheet (~49% of rows).
+      - name: title_base
+        description: Matching key without version qualifiers ("(Remastered)", "- Live", "feat. X").
+        data_tests: [not_null]
+      - name: artist_tokens
+        description: Normalised artist names split on "," "&" "feat." "ft." "with" "x".
+      - name: is_generic_title
+        description: Short/one-word title -> stronger evidence required for matching.
+      - name: version_no
+        description: SCD2 version of the song (1 = never changed).
+
+  # ---------------------------------------------------------------------------
+  - name: stg_spotify__searches
+    description: Latest Spotify search outcome per song.
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+
+  - name: stg_spotify__search_hits
+    description: Distinct (song, Spotify track) candidates of each song's latest search batch.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, spotify_track_id] }
+    columns:
+      - name: spotify_track_id
+        data_tests:
+          - not_null
+          - matches_regex:
+              arguments: { regex: '^[0-9A-Za-z]{22}$' }
+
+  - name: stg_spotify__tracks
+    description: >
+      Open SCD2 version of every Spotify track. ISRCs were normalised and
+      validated by pandas: the valid_isrc test proves no malformed ISRC got through.
+    columns:
+      - name: spotify_track_id
+        data_tests: [unique, not_null]
+      - name: isrc
+        description: Normalised ISRC (CC XXX YY NNNNN, 12 characters, no separators).
+        data_tests: [not_null, valid_isrc]
+      - name: isrc_source
+        data_tests:
+          - accepted_values:
+              arguments: { values: [search, track_lookup] }
+      - name: release_date
+        data_tests:
+          - not_in_future:
+              config: { severity: warn }   # pre-release albums can carry a future date
+      - name: duration_ms
+        data_tests:
+          - expression_is_true:
+              arguments: { expression: "duration_ms > 0" }
+              config: { severity: warn }
+
+  # ---------------------------------------------------------------------------
+  - name: stg_youtube__searches
+    description: Latest YouTube search.list outcome per song.
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+
+  - name: stg_youtube__search_hits
+    description: Distinct (song, video) candidates of each song's latest search.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, video_id] }
+    columns:
+      - name: video_id
+        data_tests:
+          - not_null
+          - matches_regex:
+              arguments: { regex: '^[A-Za-z0-9_-]{11}$' }
+
+  - name: stg_youtube__videos
+    description: Open SCD2 version of every available video with its latest statistics.
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+      - name: published_at
+        data_tests: [not_in_future]

@@ -1,0 +1,48 @@
+version: 2
+
+# =============================================================================
+# Sources = tables written by the DAG's Python tasks.
+#   clean : pandas output, UPSERTED (ReplacingMergeTree) -> always read with FINAL
+#           catalog_songs / spotify_tracks / youtube_videos are SCD Type 2
+#           (one row per business key and version_no; is_current = 1 is open)
+#   dq    : records rejected by validation (quarantine)
+#   ops   : run log, quota ledger, DQ results, alert log
+# =============================================================================
+sources:
+  - name: clean
+    database: ""          # ClickHouse has no catalog level above "database"
+    schema: clean
+    description: Silver layer - validated, de-duplicated, upserted by the pandas preprocessing tasks.
+    tables:
+      - name: catalog_songs
+        description: Catalog songs, SCD Type 2 keyed (song_code, version_no).
+      - name: spotify_tracks
+        description: Spotify tracks (releases), SCD Type 2 keyed (spotify_track_id, version_no).
+      - name: spotify_searches
+        description: Latest Spotify search outcome per song (upsert).
+      - name: spotify_search_hits
+        description: Song -> Spotify track candidates returned by the searches (upsert).
+      - name: youtube_videos
+        description: YouTube videos, SCD Type 2 keyed (video_id, version_no) + type-1 statistics.
+      - name: youtube_searches
+        description: Latest YouTube search outcome per song (upsert).
+      - name: youtube_search_hits
+        description: Song -> YouTube video candidates returned by the search (upsert).
+
+  - name: dq
+    database: ""
+    schema: dq
+    description: Data quarantine.
+    tables:
+      - name: quarantine_records
+        description: Records rejected by validation, with source, reason and the record as JSON.
+
+  - name: ops
+    database: ""
+    schema: ops
+    description: Pipeline observability tables.
+    tables:
+      - name: pipeline_runs
+      - name: api_quota_usage
+      - name: dq_results
+      - name: alert_log

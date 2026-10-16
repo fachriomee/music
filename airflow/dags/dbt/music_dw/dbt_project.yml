@@ -1,0 +1,57 @@
+# =============================================================================
+# music_dw — the dbt layer of the pipeline, executed inside ClickHouse
+# -----------------------------------------------------------------------------
+# Input: the `clean` database (silver), written by the pandas preprocessing
+# tasks of the DAG (validated, de-duplicated, upserted, SCD Type 2).
+#
+# Layers (ClickHouse database == dbt schema, see macros/generate_schema_name):
+#   staging       current SCD2 versions + matching keys (title_base, tokens ...)
+#   intermediate  song <-> recording / video matching and scoring
+#   marts         dimensional model (dims, bridges, SCD2 history) + analytics
+#                 marts + monitoring views (BI-facing, read-only for Superset)
+#   dq            stored failures of dbt tests (store_failures)
+# =============================================================================
+name: music_dw
+version: "2.0.0"
+config-version: 2
+profile: music_dw
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Matching thresholds (documented in docs/IMPLEMENTATION.md, matching rules)
+  fuzzy_title_threshold: 0.85
+  fuzzy_artist_threshold: 0.90
+  generic_title_max_chars: 5          # any title this short is generic
+  generic_single_word_max_chars: 8    # one-word titles up to this length too
+
+models:
+  music_dw:
+    +materialized: table
+    # Tables are built as <name>__dbt_tmp and swapped in atomically
+    # (EXCHANGE TABLES): dashboards never read a half-built table.
+    +engine: MergeTree()
+    staging:
+      +schema: staging
+      +tags: ["staging"]
+    intermediate:
+      +schema: intermediate
+      +tags: ["intermediate"]
+    marts:
+      +schema: marts
+      +tags: ["marts"]
+      history:
+        +tags: ["marts", "history", "scd2"]
+      monitoring:
+        # Views over ops.* / dq.*: always live, zero storage
+        +materialized: view
+        +tags: ["marts", "monitoring"]
+
+data_tests:
+  music_dw:
+    # Keep failing rows in the `dq` database for investigation
+    +store_failures: true
+    +schema: dq

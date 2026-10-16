@@ -1,0 +1,120 @@
+version: 2
+
+models:
+  - name: int_song_recording_candidates
+    description: >
+      Every Spotify hit for every song search with its title/artist evidence
+      and the match decision (see model header for the rules).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, spotify_track_id] }
+    columns:
+      - name: match_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [original_artist, other_artist, unknown_original_artist,
+                         rejected_title_mismatch, rejected_other_catalog_song, rejected_weak_fuzzy,
+                         rejected_predates_original, rejected_original_not_found]
+      - name: title_similarity
+        data_tests:
+          - expression_is_true:
+              arguments: { expression: "title_similarity between 0 and 1" }
+      - name: match_confidence
+        data_tests:
+          - accepted_values:
+              arguments: { values: [high, medium, low, none] }
+
+  - name: int_song_video_candidates
+    description: Every YouTube hit for every song search, typed (official_mv, cover, ...) and accepted/rejected.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, video_id] }
+    columns:
+      - name: video_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [non_music, karaoke, cover, live, lyric, remix, instrumental,
+                         official_mv, official_audio, other]
+      - name: match_status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [accepted, rejected_title_not_in_video, rejected_non_music,
+                         rejected_unavailable, rejected_generic_without_artist]
+
+# =============================================================================
+# dbt unit tests: verify the matching LOGIC on tiny hand-written inputs.
+# Names / ISRCs come from the provided catalog workbook (Example sheet) and
+# real Spotify results, so the cases read like the production data.
+# =============================================================================
+unit_tests:
+  - name: test_recording_matching_rules
+    description: >
+      Covers every decision branch: original artist, cover by another artist,
+      different song with a similar title, another artist's track released
+      before the original (not a cover), another artist's track when the
+      original artist is not on Spotify (unverifiable), unknown original artist, and the
+      duplicate-title rule ("DOA" by UNGU is not a cover of "DOA" by THE HERMANSYAH).
+    model: int_song_recording_candidates
+    given:
+      - input: ref('stg_catalog__songs')
+        format: sql
+        rows: |
+          select toUInt32(2197) as song_code, 'kemana' as title_base, 'kemana' as title_core,
+                 true as is_artist_known, ['koes plus'] as artist_tokens,
+                 true as is_generic_title, false as is_title_shared_in_catalog
+          union all
+          select toUInt32(2), 'doa', 'doa', true, ['the hermansyah'], true, true
+          union all
+          select toUInt32(3), 'doa', 'doa', true, ['ungu'], true, true
+          union all
+          select toUInt32(1), 'andaikan kau datang kembali', 'andaikan kau datang kembali', false, [], false, false
+          union all
+          select toUInt32(6720), 'tetaplah di sini', 'tetaplah di sini', true, ['tami aulia'], false, false
+      - input: ref('stg_spotify__search_hits')
+        format: sql
+        rows: |
+          select toUInt32(2197) as song_code, '6sD4GrpYhnxfpI8dhQF1Fl' as spotify_track_id, toUInt16(1) as best_search_rank, true as found_by_artist_query
+          union all select toUInt32(2197), '0AndmeshKemanaCover001', toUInt16(2), false
+          union all select toUInt32(2197), '6AVBDYXyuzy6qEqiqOIifQ', toUInt16(3), false
+          union all select toUInt32(2197), '0OlderSameTitleSong001', toUInt16(4), false
+          union all select toUInt32(2), '0UnguDoaAlbumTrack0001', toUInt16(1), false
+          union all select toUInt32(1), '0NoahAndaikanKauDatang', toUInt16(1), false
+          union all select toUInt32(6720), '0SameTitleOtherSong001', toUInt16(1), false
+      - input: ref('stg_spotify__tracks')
+        format: sql
+        rows: |
+          select '6sD4GrpYhnxfpI8dhQF1Fl' as spotify_track_id, 'Kemana - Live' as track_name, 'kemana' as track_title_base,
+                 'kemana' as track_title_core, ['Koes Plus'] as artist_names, ['koes plus'] as artist_names_norm,
+                 'QZDA52561958' as isrc, true as is_valid_isrc, 'live' as version_label,
+                 toDate32('1974-07-01') as release_date, 'album' as album_type
+          union all
+          select '0AndmeshKemanaCover001', 'Kemana', 'kemana', 'kemana', ['Andmesh'], ['andmesh'],
+                 'SGB502243982', true, 'original', toDate32('2021-01-01'), 'single'
+          union all
+          select '6AVBDYXyuzy6qEqiqOIifQ', 'Kemana Saja Kau Pergi', 'kemana saja kau pergi', 'kemana saja kau pergi',
+                 ['Koes Plus'], ['koes plus'], 'IDA511800251', true, 'original', toDate32('2016-02-02'), 'album'
+          union all
+          select '0OlderSameTitleSong001', 'Kemana', 'kemana', 'kemana', ['Rekam Jejak'], ['rekam jejak'],
+                 'QM3DF2002402', true, 'original', toDate32('1970-05-01'), 'single'
+          union all
+          select '0UnguDoaAlbumTrack0001', 'Doa', 'doa', 'doa', ['Ungu'], ['ungu'],
+                 'QZTBA2262919', true, 'original', toDate32('2004-01-01'), 'album'
+          union all
+          select '0SameTitleOtherSong001', 'Tetaplah Di Sini', 'tetaplah di sini', 'tetaplah di sini',
+                 ['Dead Torches'], ['dead torches'], 'QZMEM2258696', true, 'original', toDate32('2023-02-21'), 'single'
+          union all
+          select '0NoahAndaikanKauDatang', 'Andaikan Kau Datang Kembali', 'andaikan kau datang kembali',
+                 'andaikan kau datang kembali', ['Noah'], ['noah'],
+                 'UKU932330667', true, 'original', toDate32('2012-01-01'), 'single'
+    expect:
+      rows:
+        - { song_code: 2197, spotify_track_id: 6sD4GrpYhnxfpI8dhQF1Fl, match_type: original_artist, match_confidence: high }
+        - { song_code: 2197, spotify_track_id: 0AndmeshKemanaCover001, match_type: other_artist, match_confidence: low }
+        - { song_code: 2197, spotify_track_id: 6AVBDYXyuzy6qEqiqOIifQ, match_type: rejected_title_mismatch, match_confidence: none }
+        - { song_code: 2197, spotify_track_id: 0OlderSameTitleSong001, match_type: rejected_predates_original, match_confidence: none }
+        - { song_code: 2, spotify_track_id: 0UnguDoaAlbumTrack0001, match_type: rejected_other_catalog_song, match_confidence: none }
+        - { song_code: 1, spotify_track_id: 0NoahAndaikanKauDatang, match_type: unknown_original_artist, match_confidence: medium }
+        - { song_code: 6720, spotify_track_id: 0SameTitleOtherSong001, match_type: rejected_original_not_found, match_confidence: none }

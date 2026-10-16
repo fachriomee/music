@@ -1,0 +1,4 @@
+# Only music_catalog_elt.py defines a DAG: the DAG processor must not scan the
+# dbt project or the unit tests (glob syntax, Airflow 3 default).
+dbt/
+tests/

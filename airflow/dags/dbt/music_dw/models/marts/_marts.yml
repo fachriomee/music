@@ -1,0 +1,170 @@
+version: 2
+
+models:
+  # ---------------------------------------------------------------- core ----
+  - name: dim_song
+    description: Song (composition) dimension - current SCD2 version, one row per catalog song code.
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+      - name: song_version_no
+        data_tests:
+          - expression_is_true:
+              arguments: { expression: "song_version_no >= 1" }
+
+  - name: dim_recording
+    description: Recording dimension - one row per ISRC (a specific audio version of a song).
+    columns:
+      - name: isrc
+        data_tests: [unique, not_null, valid_isrc]
+      - name: spotify_release_count
+        description: Number of Spotify track ids (releases) carrying this ISRC.
+        data_tests:
+          - expression_is_true:
+              arguments: { expression: "spotify_release_count >= 1" }
+      - name: first_release_date
+        data_tests:
+          - not_in_future:
+              config: { severity: warn }
+
+  - name: dim_spotify_track
+    description: Spotify release-level dimension (track id -> ISRC is many-to-one).
+    columns:
+      - name: spotify_track_id
+        data_tests: [unique, not_null]
+      - name: isrc
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: { to: ref('dim_recording'), field: isrc }
+
+  - name: bridge_song_recording
+    description: Song 1:N Recording. Grain (song_code, isrc).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, isrc] }
+    columns:
+      - name: song_code
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: { to: ref('dim_song'), field: song_code }
+      - name: isrc
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: { to: ref('dim_recording'), field: isrc }
+      - name: match_type
+        data_tests:
+          - accepted_values:
+              arguments: { values: [original_artist, other_artist, unknown_original_artist] }
+
+  - name: dim_youtube_channel
+    columns:
+      - name: channel_id
+        data_tests: [unique, not_null]
+
+  - name: dim_youtube_video
+    description: Matched, available YouTube videos (current SCD2 version), one row per videoId.
+    columns:
+      - name: video_id
+        data_tests: [unique, not_null]
+
+  - name: bridge_song_video
+    description: Song 1:N YouTube video. Grain (song_code, video_id).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, video_id] }
+    columns:
+      - name: song_code
+        data_tests:
+          - relationships:
+              arguments: { to: ref('dim_song'), field: song_code }
+      - name: video_id
+        data_tests:
+          - relationships:
+              arguments: { to: ref('dim_youtube_video'), field: video_id }
+
+  # ------------------------------------------------------------- history ----
+  - name: dim_song_history
+    description: SCD Type 2 history of catalog songs (all versions).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [song_code, version_no] }
+
+  - name: dim_spotify_track_history
+    description: SCD Type 2 history of Spotify track metadata (all versions).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [spotify_track_id, version_no] }
+
+  - name: dim_youtube_video_history
+    description: SCD Type 2 history of YouTube video metadata (all versions).
+    data_tests:
+      - unique_combination_of_columns:
+          arguments: { combination_of_columns: [video_id, version_no] }
+
+  # ----------------------------------------------------------- analytics ----
+  - name: mart_song_isrc_summary
+    description: "Business question: how many ISRCs does each song have on Spotify? One row per song."
+    data_tests:
+      - expression_is_true:
+          arguments:
+            expression: >
+              isrc_count = isrc_count_original_artist + isrc_count_other_artists
+                           + isrc_count_unknown_artist
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+      - name: isrc_count
+        description: Distinct valid ISRCs accepted as recordings of the song (original + covers + versions).
+      - name: spotify_status
+        data_tests:
+          - accepted_values:
+              arguments: { values: [matched, no_match, search_error, not_searched] }
+
+  - name: mart_song_video_summary
+    description: "Business question: how many videos does each song have on YouTube? One row per song."
+    data_tests:
+      - expression_is_true:
+          arguments: { expression: "official_channel_video_count + ugc_video_count = video_count" }
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+      - name: youtube_status
+        data_tests:
+          - accepted_values:
+              arguments: { values: [matched, no_match, search_error, pending_quota] }
+
+  - name: mart_song_overview
+    description: One wide row per song with both answers - the main Superset dataset.
+    columns:
+      - name: song_code
+        data_tests: [unique, not_null]
+
+  # ---------------------------------------------------------- monitoring ----
+  - name: mon_pipeline_runs
+    description: Latest status per (run, task) from ops.pipeline_runs.
+  - name: mon_api_quota_daily
+    description: YouTube quota units used per Pacific day / endpoint.
+  - name: mon_dq_results
+    description: History of post-load DQ checks (ops.dq_results) with a latest flag.
+  - name: mon_quarantine_records
+    description: Quarantined records with a flag for the latest pipeline run.
+    columns:
+      - name: reject_reason
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [missing_code, non_numeric_code, missing_title, duplicate_code,
+                         invalid_track_id, missing_isrc, invalid_isrc_format,
+                         invalid_video_id, missing_channel_id, video_unavailable]
+  - name: mon_alert_log
+    description: Every e-mail alert the pipeline tried to send (sent / skipped / failed).
+  - name: mon_scd_changes
+    description: Inserts, updates and deletes captured by SCD Type 2.
+    columns:
+      - name: change_type
+        data_tests:
+          - accepted_values:
+              arguments: { values: [insert, update, delete] }

@@ -1,0 +1,20 @@
+# Installed into Airflow's own Python environment (the DAG file imports these).
+# Keep this list small: every package here must co-exist with Airflow's pins.
+
+# dbt <-> Airflow integration (renders each dbt model/test as an Airflow task)
+astronomer-cosmos==1.15.1
+
+# ClickHouse HTTP client (raw landing, clean upserts, SCD2, ops tables)
+clickhouse-connect==1.10.0
+
+# Data preprocessing (flatten JSON, standardise, validate, de-duplicate, SCD2 diff)
+# and the .xlsx catalog reader. pandas/openpyxl already ship with the Airflow image;
+# listing them makes the dependency explicit and fails the build if they vanish.
+pandas>=2.2
+openpyxl>=3.1,<4
+
+# HTTP for Spotify / YouTube / Superset (retry/backoff is a plain loop in the DAG)
+requests>=2.32,<3
+
+# Unit tests run inside the scheduler container (airflow/dags/tests)
+pytest>=8,<9

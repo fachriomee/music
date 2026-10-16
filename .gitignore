@@ -1,0 +1,18 @@
+# Secrets: .env holds every credential of the platform (share .env.example)
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# dbt artefacts (Airflow/Cosmos write them to /tmp; local dbt runs may not)
+airflow/dags/dbt/music_dw/target/
+airflow/dags/dbt/music_dw/logs/
+airflow/dags/dbt/music_dw/dbt_packages/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
